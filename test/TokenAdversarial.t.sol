@@ -10,6 +10,7 @@ contract TokenAdversarialTest is Test {
     address internal bob = makeAddr("adversarial bob");
     address internal spender = makeAddr("adversarial spender");
     address internal newcomer = makeAddr("adversarial newcomer");
+    address internal distributor = makeAddr("adversarial swarm distributor");
     address internal manager;
     uint256 internal constant SUPPLY = 1_000_000_000 ether;
 
@@ -18,11 +19,16 @@ contract TokenAdversarialTest is Test {
 
     function setUp() public {
         vm.chainId(1);
-        token = new SIMDTESTToken();
+        token = new SIMDTESTToken(1);
         manager = token.POOL_MANAGER();
         token.transfer(alice, 25_000_000 ether);
         token.transfer(bob, 75_000_000 ether);
         token.transfer(manager, 900_000_000 ether);
+    }
+
+    function distributorOf(uint64 launchNumber) external view returns (address) {
+        require(launchNumber == 1, "wrong launch number");
+        return distributor;
     }
 
     function testFeeRoundingBoundariesEmitTheActualTransfers() public {
@@ -267,11 +273,14 @@ contract TokenAdversarialTest is Test {
                 token.totalFeesCollected(),
                 token.totalDividendsClaimed(),
                 token.BUY_FEE_BPS(),
-                token.POOL_MANAGER()
+                token.POOL_MANAGER(),
+                token.FACTORY(),
+                token.LAUNCH_NUMBER(),
+                token.dividendDistributor()
             )
         );
-        address[8] memory accounts =
-            [address(this), manager, alice, bob, newcomer, spender, address(token), token.BURN_ADDRESS()];
+        address[9] memory accounts =
+            [address(this), manager, alice, bob, newcomer, spender, address(token), token.BURN_ADDRESS(), distributor];
         for (uint256 i; i < accounts.length; ++i) {
             digest = keccak256(
                 abi.encode(

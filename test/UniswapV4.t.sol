@@ -387,7 +387,10 @@ contract UniswapV4Test is Test {
         assertEq(token.balanceOf(address(buyer)), beforeBalance + gross - fee);
         assertEq(poolBefore - token.balanceOf(MANAGER), gross);
         assertEq(pairedBefore - pair.balanceOf(address(buyer)), input);
-        assertApproxEqAbs(token.claimableDividends(address(buyer)), beforeDue + fee * beforeBalance / eligible, 1);
+        // With the factory and distributor excluded, the first buyer creates eligible
+        // supply and releases the queued fee. Later buys reward pre-buy holders only.
+        beforeDue += eligible == 0 ? fee : fee * beforeBalance / eligible;
+        assertApproxEqAbs(token.claimableDividends(address(buyer)), beforeDue, 1);
         _assertActorSettled(address(buyer));
     }
 

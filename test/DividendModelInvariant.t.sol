@@ -14,10 +14,12 @@ contract DividendModelHandler is Test {
     uint256 internal constant POOL = 4;
     uint256 internal constant BURN = 5;
     uint256 internal constant RESERVE = 6;
+    uint256 internal constant FACTORY = 7;
+    uint256 internal constant DISTRIBUTOR = 8;
 
     SIMDTESTToken public token;
-    address[7] public accounts;
-    uint256[7] public balances;
+    address[9] public accounts;
+    uint256[9] public balances;
     uint256[4] public earnedScaled;
     uint256[4] public paid;
     uint256 public fees;
@@ -25,8 +27,12 @@ contract DividendModelHandler is Test {
     uint256 public queued;
     uint256 public distributions;
 
-    constructor() {
-        token = new SIMDTESTToken();
+    // Initialize after deployment so the token can call the factory's distributor lookup.
+    function initialize() external {
+        require(address(token) == address(0), "already initialized");
+        token = new SIMDTESTToken(1);
+        accounts[FACTORY] = address(this);
+        accounts[DISTRIBUTOR] = makeAddr("model swarm distributor");
         for (uint256 i; i < 4; ++i) {
             accounts[i] = makeAddr(string.concat("model holder ", vm.toString(i)));
             balances[i] = 25_000_000 ether;
@@ -39,13 +45,18 @@ contract DividendModelHandler is Test {
         token.transfer(accounts[POOL], balances[POOL]);
     }
 
+    function distributorOf(uint64 launchNumber) external view returns (address) {
+        require(launchNumber == 1, "wrong launch number");
+        return accounts[DISTRIBUTOR];
+    }
+
     function buy(uint256 toSeed, uint256 amountSeed, bool delegated) external {
-        _transfer(POOL, toSeed % 7, _amount(amountSeed, balances[POOL]), delegated);
+        _transfer(POOL, toSeed % accounts.length, _amount(amountSeed, balances[POOL]), delegated);
     }
 
     function move(uint256 fromSeed, uint256 toSeed, uint256 amountSeed, bool delegated) external {
         uint256 from = fromSeed % 4;
-        _transfer(from, toSeed % 7, _amount(amountSeed, balances[from]), delegated);
+        _transfer(from, toSeed % accounts.length, _amount(amountSeed, balances[from]), delegated);
     }
 
     /// @dev Force the zero-eligible-supply boundary into random sequences; subsequent claims
@@ -68,11 +79,11 @@ contract DividendModelHandler is Test {
         vm.expectRevert(
             abi.encodeWithSelector(SIMDTESTToken.ERC20InsufficientAllowance.selector, address(this), 0, amount)
         );
-        token.transferFrom(accounts[from], accounts[toSeed % 7], amount);
+        token.transferFrom(accounts[from], accounts[toSeed % accounts.length], amount);
     }
 
     function rejectExcludedClaim(uint256 seed) external {
-        vm.prank(accounts[POOL + seed % 3]);
+        vm.prank(accounts[POOL + seed % (accounts.length - POOL)]);
         vm.expectRevert(SIMDTESTToken.NoDividends.selector);
         token.claim();
     }
@@ -167,6 +178,7 @@ contract DividendModelInvariantTest is StdInvariant, Test {
     function setUp() public {
         vm.chainId(1);
         handler = new DividendModelHandler();
+        handler.initialize();
         token = handler.token();
         bytes4[] memory selectors = new bytes4[](6);
         selectors[0] = DividendModelHandler.buy.selector;
@@ -182,7 +194,7 @@ contract DividendModelInvariantTest is StdInvariant, Test {
     function invariantBalancesAndRewardsMatchIndependentLedger() public view {
         uint256 sum;
         uint256 debt = handler.queued();
-        for (uint256 i; i < 7; ++i) {
+        for (uint256 i; i < 9; ++i) {
             address account = handler.accounts(i);
             uint256 held = token.balanceOf(account);
             assertEq(held, handler.balances(i), "token balance differs from independent ledger");
@@ -199,12 +211,15 @@ contract DividendModelInvariantTest is StdInvariant, Test {
                 );
                 debt += due;
             } else {
+                assertTrue(token.isExcludedFromDividends(account), "launch account lost its exclusion");
                 assertEq(due, 0, "excluded account earned dividends");
             }
         }
         assertEq(sum, handler.SUPPLY());
         assertEq(token.totalSupply(), handler.SUPPLY());
-        assertEq(token.balanceOf(address(handler)), 0);
+        assertEq(token.FACTORY(), address(handler));
+        assertEq(token.LAUNCH_NUMBER(), 1);
+        assertEq(token.dividendDistributor(), handler.accounts(8));
         assertEq(token.eligibleSupply(), handler.eligible());
         assertEq(token.pendingDividends(), handler.queued());
         assertEq(token.totalFeesCollected(), handler.fees());

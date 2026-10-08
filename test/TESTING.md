@@ -18,6 +18,12 @@ cumulative index or reported eligible supply. Its one-minor-unit tolerance
 accounts for the two models' different rounding precision; balance conservation,
 fees, claims and pending amounts are compared exactly.
 
+The revised fixtures supply the launch number and implement the factory's
+distributor lookup. The model initializes after deployment so that lookup is
+callable, and tracks the factory and distributor as excluded accounts even when
+random transfers fund them. Swap reward expectations cover the first buyer
+releasing queued fees when no eligible holder exists yet.
+
 Constructor minting is checked separately from external launch allocation: the
 deployer receives the full supply, then the external factory/distributor flows
 allocate the pool and swarm shares. Pool fee 3000 follows the task's mandatory
