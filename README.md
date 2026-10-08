@@ -2,8 +2,9 @@
 
 `SIMDTESTToken` is an immutable ERC-20 with 18 decimals and a fixed supply of
 **1,000,000,000 SIMDTEST** (`1000000000000000000000000000` minor units). Its
-argument-free constructor mints the entire supply to `msg.sender`. The launch
-factory must be that deployer. There is no owner, mint function, burn function,
+constructor takes the launch's `uint64` number and mints the entire supply to
+`msg.sender`, recorded as the immutable factory. The launch factory must be that
+deployer. There is no owner, mint function, burn function,
 pause, blacklist, upgrade mechanism, fee setter, or rescue function.
 
 ## Build and test
@@ -23,7 +24,9 @@ the pinned compiler must already be installed for an offline build.
 The suite covers supply and factory allocation, buy/sell/wallet transfers,
 allowances and failed transfers, proportional claims, historical entitlements,
 excluded accounts, fractional credit, the zero-holder case, unsupported admin
-selectors, and forbidden runtime opcodes. Two fuzz tests use 512 cases each.
+selectors, and forbidden runtime opcodes. Distributor regression tests cover
+unclaimed swarm balances, partial Merkle claims, late registration, and the
+permanent exclusion cache. Two fuzz tests use 512 cases each.
 Four stateful invariants run over 128 sequences of 64 actions, checking balances,
 fee accounting, exclusions, and dividend solvency.
 
@@ -32,15 +35,18 @@ specified mainnet address in a local EVM. They deploy the actual token using
 CREATE2, allocate the swarm share, initialize and seed a single-sided pool, then
 buy and sell in both currency orders. They check net buy receipts and zero
 outstanding settlement deltas. An unpaid swap must revert with
-`CurrencyNotSettled`, rolling back its token fee. IMD and the factory are local
+`CurrencyNotSettled`, rolling back its token fee. An ERC-6909 round trip confirms
+that swaps without ERC-20 withdrawals collect no token fee. IMD and the factory are local
 test fixtures; these tests do not claim to be a mainnet fork or verification of
 the live IMD deployment.
 
 ## Launch parameters and precedence
 
-The deployable artifact is `src/SIMDTESTToken.sol:SIMDTESTToken`, with no
-constructor arguments. `launch.json` uses `kind: "custom_token"` and an empty
-application list. The token itself imports no libraries.
+The deployable artifact is `src/SIMDTESTToken.sol:SIMDTESTToken`, with constructor
+`SIMDTESTToken(uint64 launchNumber_)`. `launch.json` supplies `["$launchNumber"]`,
+uses `kind: "custom_token"` and an empty application list. The factory address is
+derived from `msg.sender`; neither value is an administrative power. The token
+itself imports no libraries.
 
 | Parameter | Value |
 | --- | --- |
@@ -69,8 +75,9 @@ the opening cap. The integration tests exercise both orderings.
 
 The existing external `ProjectFactory.launchCustom` flow must:
 
-1. Deploy `SIMDTESTToken` and hold the entire supply.
-2. Transfer exactly 100,000,000 tokens to its external Merkle distributor for
+1. Deploy `SIMDTESTToken` with the actual launch number and hold the entire supply.
+2. Register the launch's external Merkle distributor in `distributorOf(uint64)`,
+   then transfer exactly 100,000,000 tokens to that distributor for
    the swarm. Distributor-to-beneficiary claims are ordinary, untaxed transfers.
 3. Budget exactly 900,000,000 tokens for the single-sided pool seed and settle
    the seed from the factory's balance. Incoming PoolManager transfers arrive
@@ -80,7 +87,18 @@ The existing external `ProjectFactory.launchCustom` flow must:
 
 No token function performs swarm allocation or pool initialization. There is no
 requester-chosen distributor address or configurable launch recipient to supply
-to this token. `LaunchLiquidity`, `HookFlags`, and `PoolInitializationGuard` are
+to this token. Before changing balances, the token reads the factory's
+`distributorOf(LAUNCH_NUMBER)` until it returns a nonzero address, then caches it
+permanently and emits `DividendDistributorResolved`. The lookup uses a static
+call. The platform must register the correct distributor for this launch; no
+setter or later factory change can replace the cached address. Before discovery,
+ordinary transfers remain possible, but outgoing PoolManager transfers revert
+with `DistributorNotRegistered`, so no fees can accrue to an unknown distributor.
+Discovery removes any pre-registration distributor balance from eligible supply
+before accounting for the current transfer. No factory calls are needed after
+discovery. `dividendDistributor` and the exclusion view reflect the cached state.
+
+`LaunchLiquidity`, `HookFlags`, and `PoolInitializationGuard` are
 supporting source interfaces/helpers for the pinned launch compatibility checks;
 they are not additional applications in the manifest. The guard lets only its
 deploying factory initialize pools through its immutable PoolManager and has no
@@ -107,15 +125,19 @@ balance earn approximately 7.5 and 22.5 tokens. The newly purchased balance
 starts earning on later fees. If the buyer already held tokens, those old tokens
 participate in the current fee.
 
-The PoolManager, the token contract and `0x...dEaD` are permanently excluded
-from rewards. All other holders, including the external distributor and other
+The PoolManager, the token contract, `0x...dEaD`, the launch factory and the
+resolved external Merkle distributor are permanently excluded from rewards.
+Unclaimed swarm balances therefore earn nothing. Beneficiaries become eligible
+when their Merkle transfers arrive and earn only subsequent fees (or a pending
+queue if they create the first eligible supply). Other holders, including other
 contracts, are eligible. Historical rewards stay with the account that earned
 them when balances move, even if that account sells all its tokens. New balances
 never acquire historical rewards.
 
 `claimableDividends(account)` returns whole minor units currently claimable.
 `claim()` pays only `msg.sender`, reverts with `NoDividends()` if nothing is due,
-and uses an internal untaxed transfer. Claims make no external calls and give
+and uses an internal untaxed transfer. Once the distributor is cached, claims
+make no external calls and give
 the claimed tokens eligibility only for future fees. No holder iteration or
 automatic payout is performed during a transfer.
 
@@ -145,7 +167,12 @@ The fee recognizes only an ERC-20 transfer's `from` address. Consequently it als
 applies to liquidity withdrawals and other outgoing PoolManager transfers, and
 to transfers involving other pools in that singleton. It cannot distinguish a
 swap from those operations. Swaps netted entirely inside v4 without a SIMDTEST
-ERC-20 payout do not trigger a token transfer fee.
+ERC-20 payout do not trigger a token transfer fee. In particular, a trader can
+receive SIMDTEST as PoolManager ERC-6909 claims via `mint`, then sell by paying
+with those claims via `burn`, without triggering the 3% fee or funding dividends.
+ERC-6909 balances also earn no SIMDTEST dividends. A later ERC-20 withdrawal from
+the PoolManager is taxed normally. Charging every swap would require a separate
+pool-level fee mechanism; this token implements the specified transfer-based fee.
 
 Integrators must measure the recipient's net token balance for output/slippage
 checks and support fee-on-transfer outputs. An exact-output request to v4 is a
@@ -154,11 +181,10 @@ success does not establish compatibility with every router or multi-hop route.
 The settlement behavior tested here follows Uniswap's
 [PoolManager implementation](https://github.com/Uniswap/v4-core/blob/46c6834698c48bc4a463a86d8420f4eb1d7f3b75/src/PoolManager.sol).
 
-Dividends earned while swarm tokens sit in the distributor accrue to that
-distributor. They do not follow its later Merkle token transfers. Contract
-holders need their own ability to call `claim()`; if a distributor or router lacks
-that ability, its earned dividends remain reserved and inaccessible. The token
-has no administrator who can redirect them.
+The launch distributor and factory cannot strand dividend credit because they
+are excluded. Other contract holders need their own ability to call `claim()`;
+if a router or vault lacks that ability, its earned dividends remain reserved
+and inaccessible. The token has no administrator who can redirect them.
 
 Identity.md's **additional 1% creator fee** is entirely off-chain: 0.5% of swap
 volume to **$SIMD holders**, and 0.5% to IMD seat agents, as specified in the

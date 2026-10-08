@@ -5,7 +5,7 @@
     "name": "SIMDTEST",
     "symbol": "SIMDTEST",
     "decimals": 18,
-    "constructorArgs": [],
+    "constructorArgs": ["$launchNumber"],
     "totalSupply": "1000000000000000000000000000"
   },
   "contracts": [],
@@ -20,5 +20,5 @@
     "initialMarketCapWei": "2500000000000000000000",
     "remainderTo": "0x000000000000000000000000000000000000dead"
   },
-  "notes": "Ethereum mainnet (chainId 1). The constructor mints the entire fixed supply to the factory. The factory allocates 10% to its external Merkle distributor, budgets 90% for the pool and forwards any seed rounding remainder to economics.remainderTo. PoolManager: 0x000000000004444c5dc75cB358380D2e3dE08A90. Mandatory pool fee 3000 (0.30%) takes precedence over the narrative 12500 (1.25%). initialPrice is provenance only with SIMDTEST as currency0; derive the opening price and ticks from economics and actual currency ordering. Outgoing PoolManager transfers pay 3%; all incoming settlement transfers arrive whole. Identity.md's additional 1% creator fee and its 0.5% SIMD-holder / 0.5% IMD-seat-agent split are off-chain responsibilities. No token owner, admin, or post-launch configuration."
+  "notes": "Ethereum mainnet (chainId 1). The constructor takes uint64 $launchNumber, records msg.sender as the immutable factory, and mints the entire fixed supply to it. The token resolves and permanently caches factory.distributorOf(launchNumber) at transfer time; factory and distributor are excluded from dividends. The factory allocates 10% to its external Merkle distributor, budgets 90% for the pool and forwards any seed rounding remainder to economics.remainderTo. PoolManager: 0x000000000004444c5dc75cB358380D2e3dE08A90. Mandatory pool fee 3000 (0.30%) takes precedence over the narrative 12500 (1.25%). initialPrice is provenance only with SIMDTEST as currency0; derive the opening price and ticks from economics and actual currency ordering. Outgoing PoolManager transfers pay 3%; all incoming settlement transfers arrive whole. Identity.md's additional 1% creator fee and its 0.5% SIMD-holder / 0.5% IMD-seat-agent split are off-chain responsibilities. No token owner, admin, or post-launch configuration."
 }

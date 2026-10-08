@@ -37,6 +37,7 @@ contract PairFixture {
 contract FactoryFixture is IUnlockCallback {
     address private immutable controller = msg.sender;
     IPoolManager private immutable manager;
+    mapping(uint64 => address) public distributorOf;
 
     constructor(IPoolManager manager_) {
         manager = manager_;
@@ -48,7 +49,11 @@ contract FactoryFixture is IUnlockCallback {
     }
 
     function deploy(bytes32 salt) external onlyController returns (SIMDTESTToken) {
-        return new SIMDTESTToken{salt: salt}();
+        return new SIMDTESTToken{salt: salt}(1);
+    }
+
+    function registerDistributor(address distributor) external onlyController {
+        distributorOf[1] = distributor;
     }
 
     function guard() external onlyController returns (PoolInitializationGuard) {
@@ -98,6 +103,37 @@ contract TraderFixture is IUnlockCallback {
         BalanceDelta delta = manager.swap(key, SwapParams(zeroForOne, amount, limit), "");
         if (!skipPayment || delta.amount0() > 0) LaunchLiquidity.settle(manager, key.currency0, delta.amount0());
         if (!skipPayment || delta.amount1() > 0) LaunchLiquidity.settle(manager, key.currency1, delta.amount1());
+        return abi.encode(delta);
+    }
+}
+
+/// @dev Settles swaps entirely as ERC-6909 claims except for the initial IMD payment.
+contract ClaimsTraderFixture is IUnlockCallback {
+    IPoolManager private immutable manager;
+    PoolKey private key;
+
+    constructor(IPoolManager manager_) {
+        manager = manager_;
+    }
+
+    function swap(PoolKey calldata key_, bool buy, uint256 amount) external returns (BalanceDelta) {
+        key = key_;
+        return abi.decode(manager.unlock(abi.encode(buy, amount)), (BalanceDelta));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "manager only");
+        (bool buy, uint256 amount) = abi.decode(data, (bool, uint256));
+        BalanceDelta delta = manager.swap(
+            key, SwapParams(!buy, -int256(amount), buy ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1), ""
+        );
+        if (buy) {
+            manager.mint(address(this), key.currency0.toId(), uint128(delta.amount0()));
+            LaunchLiquidity.settle(manager, key.currency1, delta.amount1());
+        } else {
+            manager.burn(address(this), key.currency0.toId(), uint128(-delta.amount0()));
+            manager.mint(address(this), key.currency1.toId(), uint128(delta.amount1()));
+        }
         return abi.encode(delta);
     }
 }
@@ -156,6 +192,36 @@ contract UniswapV4Test is Test {
         _assertSettled();
     }
 
+    function testERC6909RoundTripDoesNotTriggerAnERC20TransferFee() public {
+        _launch(true);
+        ClaimsTraderFixture claimsTrader = new ClaimsTraderFixture(manager);
+        pair.mint(address(claimsTrader), 10 ether);
+        uint256 poolBefore = token.balanceOf(MANAGER);
+        BalanceDelta buy = claimsTrader.swap(key, true, 10 ether);
+        uint256 bought = uint128(buy.amount0());
+        assertGt(bought, 0);
+        assertEq(manager.balanceOf(address(claimsTrader), key.currency0.toId()), bought);
+        assertEq(token.balanceOf(MANAGER), poolBefore);
+        assertEq(token.balanceOf(address(claimsTrader)), 0);
+        assertEq(token.totalFeesCollected(), 0);
+        assertEq(manager.currencyDelta(address(claimsTrader), key.currency0), 0);
+        assertEq(manager.currencyDelta(address(claimsTrader), key.currency1), 0);
+        _assertSettled();
+
+        BalanceDelta sell = claimsTrader.swap(key, false, bought);
+        assertEq(manager.balanceOf(address(claimsTrader), key.currency0.toId()), 0);
+        assertEq(manager.balanceOf(address(claimsTrader), key.currency1.toId()), uint128(sell.amount1()));
+        assertGt(sell.amount1(), 0);
+        assertLt(sell.amount1(), int128(10 ether));
+        assertEq(token.balanceOf(MANAGER), poolBefore);
+        assertEq(token.balanceOf(address(token)), 0);
+        assertEq(token.totalFeesCollected(), 0);
+        assertEq(token.claimableDividends(address(claimsTrader)), 0);
+        assertEq(manager.currencyDelta(address(claimsTrader), key.currency0), 0);
+        assertEq(manager.currencyDelta(address(claimsTrader), key.currency1), 0);
+        _assertSettled();
+    }
+
     function testUnpaidSwapRevertsWithCurrencyNotSettledAndRollsBackFee() public {
         _launch(true);
         uint256 beforePool = token.balanceOf(MANAGER);
@@ -211,7 +277,7 @@ contract UniswapV4Test is Test {
     }
 
     function _launch(bool tokenIsZero) private {
-        bytes32 codeHash = keccak256(type(SIMDTESTToken).creationCode);
+        bytes32 codeHash = keccak256(abi.encodePacked(type(SIMDTESTToken).creationCode, abi.encode(uint64(1))));
         // Choose a real CREATE2 deployment in each currency order; never etch the token.
         for (uint256 i; i < 1000; ++i) {
             bytes32 salt = bytes32(i);
@@ -224,6 +290,7 @@ contract UniswapV4Test is Test {
         }
         require(address(token) != address(0), "CREATE2 search exhausted");
         assertEq(token.balanceOf(address(factory)), SUPPLY);
+        factory.registerDistributor(distributor);
         factory.move(token, distributor, SUPPLY / 10);
         (Currency c0, Currency c1) = tokenIsZero
             ? (Currency.wrap(address(token)), Currency.wrap(IMD))
@@ -247,6 +314,8 @@ contract UniswapV4Test is Test {
         assertEq(pair.balanceOf(MANAGER), 0);
         assertEq(token.totalFeesCollected(), 0);
         assertEq(token.balanceOf(distributor), 100_000_000 ether);
+        assertEq(token.eligibleSupply(), 0);
+        assertTrue(token.isExcludedFromDividends(distributor));
         uint256 remainder = token.balanceOf(address(factory));
         assertEq(remainder, POOL_BUDGET - seeded);
         factory.move(token, token.BURN_ADDRESS(), remainder);

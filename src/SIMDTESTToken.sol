@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+interface ISIMDLaunchFactory {
+    function distributorOf(uint64 launchNumber) external view returns (address);
+}
+
 /// @notice Fixed-supply SIMDTEST with a buy-only fee paid as token dividends.
 /// @dev The external launch factory receives the entire mint and performs all launch allocations.
-///      There are no external calls, privileged roles, holder loops, or post-constructor mint paths.
+///      Only distributor discovery calls the factory (read-only, until cached). No privileged roles,
+///      holder loops, or post-constructor mint paths exist.
 contract SIMDTESTToken {
     string public constant name = "SIMDTEST";
     string public constant symbol = "SIMDTEST";
@@ -14,6 +19,10 @@ contract SIMDTESTToken {
     uint256 public constant BUY_FEE_BPS = 300;
     uint256 public constant BPS = 10_000;
     uint256 public constant MAGNITUDE = 1 << 128;
+
+    address public immutable FACTORY;
+    uint64 public immutable LAUNCH_NUMBER;
+    address public dividendDistributor;
 
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
@@ -32,6 +41,7 @@ contract SIMDTESTToken {
     event BuyFeeAccrued(uint256 amount);
     event DividendsDistributed(uint256 amount, uint256 eligibleBalance);
     event DividendClaimed(address indexed account, uint256 amount);
+    event DividendDistributorResolved(address indexed distributor);
 
     error ERC20InvalidSender(address sender);
     error ERC20InvalidReceiver(address receiver);
@@ -39,10 +49,12 @@ contract SIMDTESTToken {
     error ERC20InsufficientBalance(address sender, uint256 balance, uint256 needed);
     error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed);
     error NoDividends();
+    error DistributorNotRegistered();
 
-    constructor() {
+    constructor(uint64 launchNumber_) {
+        FACTORY = msg.sender;
+        LAUNCH_NUMBER = launchNumber_;
         balanceOf[msg.sender] = totalSupply;
-        if (!isExcludedFromDividends(msg.sender)) eligibleSupply = totalSupply;
         emit Transfer(address(0), msg.sender, totalSupply);
     }
 
@@ -70,7 +82,8 @@ contract SIMDTESTToken {
     }
 
     function isExcludedFromDividends(address account) public view returns (bool) {
-        return account == POOL_MANAGER || account == address(this) || account == BURN_ADDRESS || account == address(0);
+        return account == POOL_MANAGER || account == address(this) || account == BURN_ADDRESS || account == address(0)
+            || account == FACTORY || account == dividendDistributor;
     }
 
     /// @notice Whole token minor units earned by an account and not yet claimed.
@@ -82,6 +95,7 @@ contract SIMDTESTToken {
 
     /// @notice Claim only the caller's accrued dividends; there is no caller-selected recipient.
     function claim() external returns (uint256 amount) {
+        _resolveDistributor();
         _accrue(msg.sender);
         amount = _scaledCredit[msg.sender] / MAGNITUDE;
         if (amount == 0) revert NoDividends();
@@ -100,6 +114,10 @@ contract SIMDTESTToken {
         uint256 available = balanceOf[from];
         if (available < amount) revert ERC20InsufficientBalance(from, available, amount);
 
+        _resolveDistributor();
+        // No dividends may accrue before the launch's distributor is known and excluded.
+        if (from == POOL_MANAGER && dividendDistributor == address(0)) revert DistributorNotRegistered();
+
         // Incoming settlement always arrives whole, including a PoolManager self-transfer.
         uint256 fee = from == POOL_MANAGER && to != POOL_MANAGER ? amount * BUY_FEE_BPS / BPS : 0;
         if (fee != 0) {
@@ -113,6 +131,17 @@ contract SIMDTESTToken {
         _move(from, to, amount - fee);
         // If there were no eligible holders, release queued fees once eligible tokens exist.
         _distributePending();
+    }
+
+    function _resolveDistributor() private {
+        if (dividendDistributor != address(0)) return;
+        address registered = ISIMDLaunchFactory(FACTORY).distributorOf(LAUNCH_NUMBER);
+        if (registered == address(0)) return;
+        // Registration follows deployment. Account for any balance received before registration;
+        // no buy fees can have accrued yet. Cache once so later factory changes have no effect.
+        if (!isExcludedFromDividends(registered)) eligibleSupply -= balanceOf[registered];
+        dividendDistributor = registered;
+        emit DividendDistributorResolved(registered);
     }
 
     function _move(address from, address to, uint256 amount) private {

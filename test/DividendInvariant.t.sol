@@ -14,8 +14,9 @@ contract DividendHandler is Test {
     uint256 public observedClaims;
     uint256 public donations;
 
-    constructor() {
-        token = new SIMDTESTToken();
+    function initialize() external {
+        require(address(token) == address(0), "already initialized");
+        token = new SIMDTESTToken(1);
         manager = token.POOL_MANAGER();
         burn = token.BURN_ADDRESS();
         for (uint256 i; i < holders.length; ++i) {
@@ -23,6 +24,10 @@ contract DividendHandler is Test {
             token.transfer(holders[i], 25_000_000 ether);
         }
         token.transfer(manager, 900_000_000 ether);
+    }
+
+    function distributorOf(uint64) external pure returns (address) {
+        return address(0xD157); // Test-only external distributor, initially empty.
     }
 
     function buy(uint256 recipientSeed, uint256 amountSeed) external {
@@ -90,10 +95,12 @@ contract DividendHandler is Test {
     }
 
     function _recipient(uint256 seed) private view returns (address) {
-        uint256 index = seed % 7;
+        uint256 index = seed % 9;
         if (index < 4) return holders[index];
         if (index == 4) return manager;
         if (index == 5) return burn;
+        if (index == 7) return token.dividendDistributor();
+        if (index == 8) return address(this);
         return address(token);
     }
 }
@@ -104,6 +111,7 @@ contract DividendInvariantTest is StdInvariant, Test {
 
     function setUp() public {
         handler = new DividendHandler();
+        handler.initialize();
         token = handler.token();
         bytes4[] memory selectors = new bytes4[](4);
         selectors[0] = DividendHandler.buy.selector;
@@ -120,7 +128,8 @@ contract DividendInvariantTest is StdInvariant, Test {
             eligible += token.balanceOf(handler.holders(i));
         }
         uint256 excluded = token.balanceOf(token.POOL_MANAGER()) + token.balanceOf(token.BURN_ADDRESS())
-            + token.balanceOf(address(token));
+            + token.balanceOf(address(token)) + token.balanceOf(token.dividendDistributor())
+            + token.balanceOf(token.FACTORY());
         assertEq(eligible, token.eligibleSupply());
         assertEq(eligible + excluded, token.totalSupply());
         assertEq(token.totalSupply(), 1_000_000_000 ether);
@@ -149,5 +158,7 @@ contract DividendInvariantTest is StdInvariant, Test {
         assertEq(token.claimableDividends(token.POOL_MANAGER()), 0);
         assertEq(token.claimableDividends(token.BURN_ADDRESS()), 0);
         assertEq(token.claimableDividends(address(token)), 0);
+        assertEq(token.claimableDividends(token.dividendDistributor()), 0);
+        assertEq(token.claimableDividends(token.FACTORY()), 0);
     }
 }

@@ -15,8 +15,13 @@ contract SIMDTESTTokenTest is Test {
 
     function setUp() public {
         vm.chainId(1);
-        token = new SIMDTESTToken();
+        token = new SIMDTESTToken(1);
         manager = token.POOL_MANAGER();
+    }
+
+    function distributorOf(uint64 launchNumber) external view returns (address) {
+        require(launchNumber == 1, "wrong launch number");
+        return distributor;
     }
 
     function testConstructorMintsOnlyToDeployer() public view {
@@ -27,7 +32,10 @@ contract SIMDTESTTokenTest is Test {
         assertEq(token.balanceOf(address(this)), SUPPLY);
         assertEq(token.balanceOf(manager), 0);
         assertEq(token.balanceOf(address(token)), 0);
-        assertEq(token.eligibleSupply(), SUPPLY);
+        assertEq(token.eligibleSupply(), 0);
+        assertEq(token.FACTORY(), address(this));
+        assertEq(token.LAUNCH_NUMBER(), 1);
+        assertTrue(token.isExcludedFromDividends(address(this)));
     }
 
     function testExternalFactoryAllocationAndSwarmClaimArriveWhole() public {
@@ -36,11 +44,95 @@ contract SIMDTESTTokenTest is Test {
         assertEq(token.balanceOf(address(this)), 0);
         assertEq(token.balanceOf(distributor), 100_000_000 ether);
         assertEq(token.balanceOf(manager), 900_000_000 ether);
+        assertEq(token.eligibleSupply(), 0);
+        assertEq(token.dividendDistributor(), distributor);
         vm.prank(distributor);
         token.transfer(alice, 100_000_000 ether);
         assertEq(token.balanceOf(alice), 100_000_000 ether);
+        assertEq(token.eligibleSupply(), 100_000_000 ether);
         assertEq(token.totalFeesCollected(), 0);
         assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function testBuyFeesAreNotStrandedOnTheMerkleDistributor() public {
+        token.transfer(distributor, 100_000_000 ether);
+        token.transfer(manager, 900_000_000 ether);
+        vm.prank(manager);
+        token.transfer(alice, 10_000_000 ether);
+        vm.prank(manager);
+        token.transfer(bob, 10_000_000 ether);
+
+        assertEq(token.totalFeesCollected(), 600_000 ether);
+        assertEq(token.balanceOf(address(token)), 600_000 ether);
+        assertEq(token.claimableDividends(distributor), 0);
+        assertEq(token.claimableDividends(address(this)), 0);
+        assertApproxEqAbs(
+            token.claimableDividends(alice) + token.claimableDividends(bob) + token.pendingDividends(), 600_000 ether, 1
+        );
+        vm.prank(distributor);
+        vm.expectRevert(SIMDTESTToken.NoDividends.selector);
+        token.claim();
+        _claimAndCheck(alice);
+        assertLe(token.balanceOf(address(token)), 1);
+    }
+
+    function testSwarmBeneficiaryEarnsOnlyAfterMerkleTransfer() public {
+        token.transfer(distributor, 100_000_000 ether);
+        token.transfer(manager, 900_000_000 ether);
+        vm.prank(manager);
+        token.transfer(alice, 1_000 ether);
+        uint256 alicePast = token.claimableDividends(alice);
+        vm.prank(distributor);
+        token.transfer(bob, 20_000_000 ether);
+        assertEq(token.balanceOf(distributor), 80_000_000 ether);
+        assertEq(token.balanceOf(bob), 20_000_000 ether);
+        assertEq(token.claimableDividends(distributor), 0);
+        assertEq(token.claimableDividends(bob), 0);
+        assertEq(token.claimableDividends(alice), alicePast);
+        uint256 eligible = token.eligibleSupply();
+        assertEq(eligible, 20_000_000 ether + 970 ether);
+        vm.prank(manager);
+        token.transfer(carol, 1_000 ether);
+        assertApproxEqAbs(token.claimableDividends(bob), 30 ether * 20_000_000 ether / eligible, 1);
+        assertEq(token.claimableDividends(distributor), 0);
+        _claimAndCheck(bob);
+    }
+
+    function testLateRegistrationRemovesPriorBalanceBeforeAnyFee() public {
+        address actualDistributor = distributor;
+        distributor = address(0); // Test the factory's not-yet-registered state.
+        token.transfer(actualDistributor, 100_000_000 ether);
+        token.transfer(manager, 900_000_000 ether);
+        assertEq(token.eligibleSupply(), 100_000_000 ether);
+        vm.prank(manager);
+        vm.expectRevert(SIMDTESTToken.DistributorNotRegistered.selector);
+        token.transfer(alice, 1_000 ether);
+        assertEq(token.totalFeesCollected(), 0);
+        assertEq(token.balanceOf(manager), 900_000_000 ether);
+
+        distributor = actualDistributor;
+        vm.prank(manager);
+        token.transfer(alice, 1_000 ether);
+        assertEq(token.dividendDistributor(), actualDistributor);
+        assertEq(token.eligibleSupply(), 970 ether);
+        assertEq(token.claimableDividends(actualDistributor), 0);
+        assertApproxEqAbs(token.claimableDividends(alice), 30 ether, 1);
+    }
+
+    function testCachedDistributorCannotBeChangedByFactory() public {
+        address actualDistributor = distributor;
+        token.transfer(distributor, 100_000_000 ether);
+        token.transfer(manager, 900_000_000 ether);
+        distributor = alice;
+        // No more lookups, even if the factory later reverts or disappears.
+        vm.mockCallRevert(address(this), abi.encodeWithSelector(this.distributorOf.selector), "unavailable");
+        vm.prank(manager);
+        token.transfer(alice, 1_000 ether);
+        assertEq(token.dividendDistributor(), actualDistributor);
+        assertTrue(token.isExcludedFromDividends(actualDistributor));
+        assertFalse(token.isExcludedFromDividends(alice));
+        assertApproxEqAbs(token.claimableDividends(alice), 30 ether, 1);
+        _claimAndCheck(alice);
     }
 
     function testBuyDeductsThreePercentAndSellDeliversFullAmount() public {
@@ -50,7 +142,7 @@ contract SIMDTESTTokenTest is Test {
         assertEq(token.balanceOf(alice), 970 ether);
         assertEq(token.balanceOf(address(token)), 30 ether);
         assertEq(token.totalFeesCollected(), 30 ether);
-        assertEq(token.claimableDividends(alice), 0);
+        assertApproxEqAbs(token.claimableDividends(alice), 30 ether, 1);
         uint256 poolBefore = token.balanceOf(manager);
         vm.prank(alice);
         token.transfer(manager, 970 ether);
@@ -68,7 +160,7 @@ contract SIMDTESTTokenTest is Test {
         vm.stopPrank();
         assertEq(token.balanceOf(alice), 30 ether);
         assertEq(token.balanceOf(bob), 70 ether);
-        assertEq(token.eligibleSupply(), SUPPLY);
+        assertEq(token.eligibleSupply(), 100 ether);
         assertEq(token.totalFeesCollected(), 0);
     }
 
@@ -78,7 +170,7 @@ contract SIMDTESTTokenTest is Test {
         token.transfer(manager, 100 ether);
         assertEq(token.balanceOf(manager), 100 ether);
         assertEq(token.totalFeesCollected(), 0);
-        assertEq(token.eligibleSupply(), SUPPLY - 100 ether);
+        assertEq(token.eligibleSupply(), 0);
     }
 
     function testSeveralBuysAccrueProportionallyBeforeEachBuy() public {
@@ -155,7 +247,7 @@ contract SIMDTESTTokenTest is Test {
         vm.prank(manager);
         token.transfer(bob, 1_000 ether);
         assertApproxEqAbs(token.claimableDividends(alice), 30 ether, 1);
-        address[3] memory excluded = [manager, address(token), token.BURN_ADDRESS()];
+        address[5] memory excluded = [manager, address(token), token.BURN_ADDRESS(), distributor, address(this)];
         for (uint256 i; i < excluded.length; ++i) {
             assertTrue(token.isExcludedFromDividends(excluded[i]));
             assertEq(token.claimableDividends(excluded[i]), 0);
@@ -294,7 +386,7 @@ contract SIMDTESTTokenTest is Test {
         token.transferFrom(alice, bob, 2);
         assertEq(token.allowance(alice, bob), 2);
         assertEq(token.totalFeesCollected(), 0);
-        assertEq(token.eligibleSupply(), SUPPLY);
+        assertEq(token.eligibleSupply(), 0);
         vm.expectRevert(abi.encodeWithSelector(SIMDTESTToken.ERC20InvalidSender.selector, address(0)));
         token.transferFrom(address(0), alice, 0);
     }
@@ -356,7 +448,7 @@ contract SIMDTESTTokenTest is Test {
         assertEq(token.balanceOf(alice), amount - expectedFee);
         assertEq(token.balanceOf(address(token)), expectedFee);
         assertEq(token.balanceOf(manager), SUPPLY * 9 / 10 - amount);
-        assertEq(token.eligibleSupply(), SUPPLY / 10 + amount - expectedFee);
+        assertEq(token.eligibleSupply(), amount - expectedFee);
         assertEq(token.totalSupply(), SUPPLY);
     }
 
