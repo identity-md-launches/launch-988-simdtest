@@ -13,6 +13,8 @@ import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {SIMDTESTToken} from "../src/SIMDTESTToken.sol";
 import {LaunchLiquidity} from "../src/LaunchLiquidity.sol";
 import {PoolInitializationGuard} from "../src/PoolInitializationGuard.sol";
@@ -29,6 +31,18 @@ contract PairFixture {
     function transfer(address to, uint256 amount) external returns (bool) {
         balanceOf[msg.sender] -= amount;
         balanceOf[to] += amount;
+        return true;
+    }
+}
+
+/// @dev Fault-injection pair with the same balance storage as PairFixture. It makes a
+/// settlement arrive one minor unit short, exercising the helper's explicit failure path.
+contract ShortPaymentPairFixture {
+    mapping(address => uint256) public balanceOf;
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount - 1;
         return true;
     }
 }
@@ -88,6 +102,10 @@ contract TraderFixture is IUnlockCallback {
         manager = manager_;
     }
 
+    function claimDividends(SIMDTESTToken token) external returns (uint256) {
+        return token.claim();
+    }
+
     function swap(PoolKey calldata key_, bool zeroForOne, int256 amount, bool skipPayment)
         external
         returns (BalanceDelta)
@@ -140,6 +158,8 @@ contract ClaimsTraderFixture is IUnlockCallback {
 
 contract UniswapV4Test is Test {
     using TransientStateLibrary for IPoolManager;
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
 
     address internal constant MANAGER = 0x000000000004444c5dc75cB358380D2e3dE08A90;
     address internal constant IMD = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
@@ -274,6 +294,177 @@ contract UniswapV4Test is Test {
         trader.unlockCallback("");
         vm.expectRevert("manager only");
         factory.unlockCallback("");
+    }
+
+    /// forge-config: default.fuzz.runs = 128
+    function testFuzzMultipleTradersBuyClaimAndSellInBothCurrencyOrders(
+        bool tokenIsZero,
+        uint96 firstRaw,
+        uint96 secondRaw,
+        uint8 roundsRaw
+    ) public {
+        _launch(tokenIsZero);
+        (,,, uint24 lpFee) = manager.getSlot0(key.toId());
+        assertEq(lpFee, 3000, "mandatory launch pool fee");
+        assertEq(key.tickSpacing, 60);
+        assertEq(Currency.unwrap(tokenIsZero ? key.currency1 : key.currency0), IMD);
+
+        TraderFixture other = new TraderFixture(manager);
+        pair.mint(address(other), 10 ether);
+        uint256 firstAmount = bound(firstRaw, 1e12, 0.1 ether);
+        uint256 secondAmount = bound(secondRaw, 1e12, 0.1 ether);
+        uint256 rounds = bound(roundsRaw, 1, 4);
+        uint256 collected;
+        for (uint256 i; i < rounds; ++i) {
+            collected += _buyAndCheck(trader, tokenIsZero, firstAmount);
+            collected += _buyAndCheck(other, tokenIsZero, secondAmount);
+            _claimTraderDividends(trader);
+            _claimTraderDividends(other);
+        }
+        assertEq(token.totalFeesCollected(), collected);
+        assertGt(token.totalDividendsClaimed(), 0, "second buy must reward the first trader");
+        _sellAllAndCheck(trader, tokenIsZero);
+        _sellAllAndCheck(other, tokenIsZero);
+        assertEq(token.totalFeesCollected(), collected, "sell settlement charged a token fee");
+        assertEq(token.totalSupply(), SUPPLY);
+        uint256 accounted = token.balanceOf(MANAGER) + token.balanceOf(distributor)
+            + token.balanceOf(token.BURN_ADDRESS()) + token.balanceOf(address(token));
+        assertEq(accounted, SUPPLY, "round trip lost or minted token units");
+        assertEq(token.claimableDividends(MANAGER), 0);
+        assertEq(token.claimableDividends(address(token)), 0);
+    }
+
+    function testUnpaidBuyRestoresExistingRewardsWithTokenAsCurrency0() public {
+        _failedBuyRestoresExistingRewards(true);
+    }
+
+    function testUnpaidBuyRestoresExistingRewardsWithTokenAsCurrency1() public {
+        _failedBuyRestoresExistingRewards(false);
+    }
+
+    function testIncomingPairShortfallRevertsAndRollsBackTokenPayout() public {
+        // Taking currency0 happens before paying currency1: the failure must revert the
+        // already executed token payout, fee accrual and all holder checkpoints as well.
+        _launch(true);
+        trader.swap(key, false, -int256(0.01 ether), false);
+        bytes32 beforeState = _swapStateDigest();
+        vm.etch(IMD, address(new ShortPaymentPairFixture()).code);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LaunchLiquidity.SettlementShortfall.selector, uint256(0.01 ether), uint256(0.01 ether - 1)
+            )
+        );
+        trader.swap(key, false, -int256(0.01 ether), false);
+        assertEq(_swapStateDigest(), beforeState);
+        _assertSettled();
+    }
+
+    function testZeroSwapAndLockedTakeCannotMovePoolFunds() public {
+        _launch(true);
+        bytes32 beforeState = _swapStateDigest();
+        vm.expectRevert(IPoolManager.SwapAmountCannotBeZero.selector);
+        trader.swap(key, false, 0, false);
+        assertEq(_swapStateDigest(), beforeState);
+        vm.expectRevert(IPoolManager.ManagerLocked.selector);
+        manager.take(Currency.wrap(address(token)), address(this), 1 ether);
+        assertEq(_swapStateDigest(), beforeState);
+        _assertSettled();
+    }
+
+    function _buyAndCheck(TraderFixture buyer, bool tokenIsZero, uint256 input) private returns (uint256 fee) {
+        uint256 poolBefore = token.balanceOf(MANAGER);
+        uint256 beforeBalance = token.balanceOf(address(buyer));
+        uint256 beforeDue = token.claimableDividends(address(buyer));
+        uint256 eligible = token.eligibleSupply();
+        uint256 pairedBefore = pair.balanceOf(address(buyer));
+        BalanceDelta delta = buyer.swap(key, !tokenIsZero, -int256(input), false);
+        int128 output = tokenIsZero ? delta.amount0() : delta.amount1();
+        int128 consumed = tokenIsZero ? delta.amount1() : delta.amount0();
+        assertGt(output, 0);
+        assertEq(int256(consumed), -int256(input));
+        uint256 gross = uint128(output);
+        fee = gross * 3 / 100;
+        assertEq(token.balanceOf(address(buyer)), beforeBalance + gross - fee);
+        assertEq(poolBefore - token.balanceOf(MANAGER), gross);
+        assertEq(pairedBefore - pair.balanceOf(address(buyer)), input);
+        assertApproxEqAbs(token.claimableDividends(address(buyer)), beforeDue + fee * beforeBalance / eligible, 1);
+        _assertActorSettled(address(buyer));
+    }
+
+    function _claimTraderDividends(TraderFixture holder) private {
+        uint256 due = token.claimableDividends(address(holder));
+        if (due == 0) return;
+        uint256 balance = token.balanceOf(address(holder));
+        uint256 reserve = token.balanceOf(address(token));
+        assertEq(holder.claimDividends(token), due);
+        assertEq(token.balanceOf(address(holder)), balance + due);
+        assertEq(token.balanceOf(address(token)), reserve - due);
+        assertEq(token.claimableDividends(address(holder)), 0);
+    }
+
+    function _sellAllAndCheck(TraderFixture seller, bool tokenIsZero) private {
+        uint256 amount = token.balanceOf(address(seller));
+        uint256 poolBefore = token.balanceOf(MANAGER);
+        uint256 pairedBefore = pair.balanceOf(address(seller));
+        uint256 feesBefore = token.totalFeesCollected();
+        BalanceDelta delta = seller.swap(key, tokenIsZero, -int256(amount), false);
+        int128 input = tokenIsZero ? delta.amount0() : delta.amount1();
+        int128 output = tokenIsZero ? delta.amount1() : delta.amount0();
+        assertEq(int256(input), -int256(amount));
+        assertGt(output, 0);
+        assertEq(token.balanceOf(address(seller)), 0);
+        assertEq(token.balanceOf(MANAGER) - poolBefore, amount);
+        assertEq(pair.balanceOf(address(seller)) - pairedBefore, uint128(output));
+        assertEq(token.totalFeesCollected(), feesBefore);
+        _assertActorSettled(address(seller));
+    }
+
+    function _failedBuyRestoresExistingRewards(bool tokenIsZero) private {
+        _launch(tokenIsZero);
+        _buyAndCheck(trader, tokenIsZero, 0.01 ether);
+        bytes32 beforeState = _swapStateDigest();
+        vm.expectRevert(IPoolManager.CurrencyNotSettled.selector);
+        trader.swap(key, !tokenIsZero, -int256(0.02 ether), true);
+        assertEq(_swapStateDigest(), beforeState, "unpaid swap changed balances, rewards or pool state");
+        _assertSettled();
+        // A valid trade must still work after the failed unlock.
+        _buyAndCheck(trader, tokenIsZero, 0.02 ether);
+    }
+
+    function _swapStateDigest() private view returns (bytes32) {
+        (uint160 price, int24 tick, uint24 protocolFee, uint24 lpFee) = manager.getSlot0(key.toId());
+        (uint256 growth0, uint256 growth1) = manager.getFeeGrowthGlobals(key.toId());
+        bytes32 poolState = keccak256(abi.encode(price, tick, protocolFee, lpFee, growth0, growth1));
+        bytes32 rewards = keccak256(
+            abi.encode(
+                token.eligibleSupply(),
+                token.dividendsPerToken(),
+                token.pendingDividends(),
+                token.totalFeesCollected(),
+                token.totalDividendsClaimed(),
+                token.claimableDividends(distributor),
+                token.claimableDividends(address(trader))
+            )
+        );
+        return keccak256(
+            abi.encode(
+                poolState,
+                rewards,
+                token.balanceOf(MANAGER),
+                token.balanceOf(address(trader)),
+                token.balanceOf(address(token)),
+                pair.balanceOf(MANAGER),
+                pair.balanceOf(address(trader))
+            )
+        );
+    }
+
+    function _assertActorSettled(address actor) private view {
+        _assertSettled();
+        assertEq(manager.currencyDelta(actor, key.currency0), 0);
+        assertEq(manager.currencyDelta(actor, key.currency1), 0);
+        assertEq(manager.currencyDelta(address(factory), key.currency0), 0);
+        assertEq(manager.currencyDelta(address(factory), key.currency1), 0);
     }
 
     function _launch(bool tokenIsZero) private {
